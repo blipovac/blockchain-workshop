@@ -3,16 +3,20 @@ use futures::{prelude::*, select};
 use libp2p::{
     core::upgrade,
     gossipsub,
-    identity::{self, ed25519, ed25519::PublicKey},
+    identity::{
+        self,
+        ed25519::{self, PublicKey},
+    },
     mdns, noise,
     swarm::NetworkBehaviour,
     swarm::{SwarmBuilder, SwarmEvent},
     tcp, yamux, PeerId, Transport,
 };
-use std::collections::HashSet;
-use std::sync::Arc;
-use std::{error::Error, sync::Mutex};
-use std::{fs, time::Duration};
+use std::time::Duration;
+use std::{
+    error::Error,
+    sync::{Arc, Mutex},
+};
 
 // We create a custom network behaviour that combines Gossipsub and Mdns.
 #[derive(NetworkBehaviour)]
@@ -47,12 +51,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let keypair_clone = id_keys.clone();
 
-    // To content-address message, we can take the hash of message and use it as an ID.
+    // Message signing function
     let message_id_fn = move |message: &gossipsub::Message| {
+        // We take our private key and sign the message
+        // The resulting signature is in bytes
         let message_signature = keypair_clone
             .sign(&message.data)
             .expect("failed signing message data");
 
+        // Serialize the public key into bytes
+        // The public key is 32 bytes long
         let public_key = keypair_clone
             .public()
             .into_ed25519()
@@ -82,12 +90,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let transactions_topic = gossipsub::IdentTopic::new("transaction");
     // subscribes to our topic
     gossipsub.subscribe(&transactions_topic)?;
-    let transaction_topic_hash = transactions_topic.hash();
-
-    // Create a topic over which we will notify nodes to start validating transactions
-    let vote_topic = gossipsub::IdentTopic::new("vote");
-    gossipsub.subscribe(&vote_topic)?;
-    let vote_topic_hash = vote_topic.hash();
 
     // Create a Swarm to manage peers and events
     let mut swarm = {
@@ -105,86 +107,31 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("Enter messages via STDIN and they will be sent to connected peers using Gossipsub");
 
     let mempool = Arc::new(Mutex::new(Vec::<Transaction>::new()));
-    let mut block_height = 1u32;
-
-    let voters = Arc::new(Mutex::new(HashSet::<PeerId>::new()));
 
     // Kick it off
     loop {
-        let number_of_peers = swarm.behaviour_mut().gossipsub.all_peers().count();
-
-        // consensus was reached clear the voters for current block height
-        if voters.lock().unwrap().len() == number_of_peers && number_of_peers > 0 {
-            println!("------> collected all of the votes executing consensus");
-            println!("------> taking first 10 transactions from mempool");
-            let first_ten_trx = mempool
-                .lock()
-                .unwrap()
-                .drain(..10)
-                .collect::<Vec<Transaction>>();
-
-            println!("-----> writing block to the disk");
-            let file_name = format!("block_{block_height}.txt");
-            let file_contents = format!("{first_ten_trx:?}");
-            fs::write(file_name, file_contents).unwrap();
-
-            println!("----> clearing votes collected for the current block");
-            voters.clone().lock().unwrap().clear();
-
-            block_height += 1;
-        }
-
         select! {
             line = stdin.select_next_some() => {
                 println!("------> Transaction received on node: storing into local mempool and publishing");
                 let read_line = line.expect("Stdin not to close");
-
-                let typed_keypair = id_keys.clone().into_ed25519().unwrap();
-
-                mempool.lock().unwrap().push(Transaction {
-                    public_key: typed_keypair.public(),
-                    data: read_line.clone().as_bytes().to_vec(),
-                    signature: typed_keypair.sign(read_line.clone().as_bytes())
-                });
 
                 if let Err(e) = swarm.behaviour_mut().gossipsub.publish(
                     transactions_topic.clone(),
                     read_line.as_bytes(),
                 ) {
                     println!("Publish error: {e:?}");
+                } else {
+                    let typed_keypair = id_keys.clone().into_ed25519().unwrap();
+
+                    mempool.lock().unwrap().push(Transaction {
+                        public_key: typed_keypair.public(),
+                        data: read_line.clone().as_bytes().to_vec(),
+                        signature: typed_keypair.sign(read_line.clone().as_bytes())
+                    });
+
+                    println!("------> Transaction stored and published");
+                    println!("{mempool:?}");
                 }
-
-                if mempool.lock().unwrap().len() == 10 {
-                    println!("-----> 10 transactions collected on local node, validating...");
-                    let mut correct_transaction_num: u32 = 0;
-
-                    for transaction in mempool.lock().unwrap().iter() {
-                        let is_valid = transaction.public_key.verify(&transaction.data, &transaction.signature);
-
-                        if is_valid {
-                            correct_transaction_num += 1;
-                        }
-                    }
-
-                    let peer_id_string = local_peer_id.to_string();
-                    let vote_message = format!("{block_height}{peer_id_string}");
-                    println!("----> vote message: {vote_message}");
-
-                    // Since gossipsub doesn't like duplicated messages we're going to make our messages
-                    // unique by adding our node peer_id to the block height
-                    if correct_transaction_num == 10 {
-                        println!("------> all transactions are valid sending vote");
-
-                        if let Err(e) = swarm
-                            .behaviour_mut()
-                            .gossipsub
-                            .publish(vote_topic.clone(), vote_message.as_bytes()) {
-                                println!("Publish error when casting vote: {e:?}");
-                            }
-                    }
-                }
-
-                println!("------> Transaction stored and published");
             },
             event = swarm.select_next_some() => match event {
                 SwarmEvent::Behaviour(EduCoinBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
@@ -200,7 +147,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     }
                 },
                 SwarmEvent::Behaviour(EduCoinBehaviourEvent::Gossipsub(gossipsub::Event::Message {
-                    propagation_source: peer_id,
+                    propagation_source: _peer_id,
                     message_id: id,
                     message,
                 })) => {
@@ -214,59 +161,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     // reconstruct the public key from bytes received
                     let public_key = ed25519::PublicKey::decode(&public_key).unwrap();
 
-                    // handle consensus votes
-                    if message.topic == vote_topic_hash {
-                        println!("------> got a vote, storing the voter");
-                        if public_key.verify(&message.data, &signature) {
-                            voters.clone().lock().unwrap().insert(peer_id);
-                        }
-                    }
+                    println!("{}", String::from_utf8_lossy(&message.data));
 
-                    if message.topic == transaction_topic_hash {
-                        println!("------> got a new transactions, storing into mempool");
-                        // create a transaction struct and push it into mempool
-                        let transaction = Transaction {
-                            public_key,
-                            signature: signature.to_vec(),
-                            data: message.data
-                        };
-                        mempool.lock().unwrap().push(transaction);
+                    println!("------> got a new transaction, storing into mempool");
 
-                        let mempool_len = mempool.lock().unwrap().len();
-                        println!("-----> num of transactions in mempool: {mempool_len}");
+                    // create a transaction struct and push it into mempool
+                    let transaction = Transaction {
+                        public_key,
+                        signature: signature.to_vec(),
+                        data: message.data
+                    };
+                    mempool.lock().unwrap().push(transaction);
 
-                        // oh no, duplicated code! :D
-                        if mempool.lock().unwrap().len() == 10 {
-                            println!("------> collected 10 transactions, validating...");
-                            let mut correct_transaction_num: u32 = 0;
-
-                            for transaction in mempool.lock().unwrap().iter() {
-                                let is_valid = transaction.public_key.verify(&transaction.data, &transaction.signature);
-
-                                if is_valid {
-                                    correct_transaction_num += 1;
-                                }
-                            }
-
-                            // Since gossipsub doesn't like duplicated messages we're going to make our messages
-                            // unique by adding our node peer_id to the block height
-                            let peer_id_string = local_peer_id.to_string();
-                            let vote_message = format!("{block_height}{peer_id_string}");
-
-                            if correct_transaction_num == 10 {
-                                println!("------> all transactions are valid sending vote");
-
-                                if let Err(e) = swarm
-                                    .behaviour_mut()
-                                    .gossipsub
-                                    .publish(vote_topic.clone(), vote_message.as_bytes()) {
-                                        println!("Publish error when casting vote: {e:?}");
-                                    }
-                            }
-                        }
-
-                        println!("{mempool:?}");
-                    }
+                    let mempool_len = mempool.lock().unwrap().len();
+                    println!("-----> num of transactions in mempool: {mempool_len}");
+                    println!("{mempool:?}");
                 },
                 SwarmEvent::NewListenAddr { address, .. } => {
                     println!("Local node is listening on {address}");
