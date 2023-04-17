@@ -170,7 +170,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     let vote_message = format!("{block_height}{peer_id_string}");
                     println!("----> vote message: {vote_message}");
 
-                    // if every transaction is correct cast our vote by signing block height with the private key
+                    // Since gossipsub doesn't like duplicated messages we're going to make our messages
+                    // unique by adding our node peer_id to the block height
                     if correct_transaction_num == 10 {
                         println!("------> all transactions are valid sending vote");
 
@@ -247,10 +248,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 }
                             }
 
+                            // Since gossipsub doesn't like duplicated messages we're going to make our messages
+                            // unique by adding our node peer_id to the block height
                             let peer_id_string = local_peer_id.to_string();
                             let vote_message = format!("{block_height}{peer_id_string}");
 
-                            // if every transaction is correct cast our vote by signing block height with the private key
                             if correct_transaction_num == 10 {
                                 println!("------> all transactions are valid sending vote");
 
