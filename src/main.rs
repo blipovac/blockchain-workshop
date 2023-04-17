@@ -3,16 +3,20 @@ use futures::{prelude::*, select};
 use libp2p::{
     core::upgrade,
     gossipsub,
-    identity::{self, ed25519, ed25519::PublicKey},
+    identity::{
+        self,
+        ed25519::{self, PublicKey},
+    },
     mdns, noise,
     swarm::NetworkBehaviour,
     swarm::{SwarmBuilder, SwarmEvent},
     tcp, yamux, PeerId, Transport,
 };
-use std::collections::HashSet;
-use std::sync::Arc;
-use std::{error::Error, sync::Mutex};
-use std::{fs, time::Duration};
+use std::{collections::HashSet, fs, time::Duration};
+use std::{
+    error::Error,
+    sync::{Arc, Mutex},
+};
 
 // We create a custom network behaviour that combines Gossipsub and Mdns.
 #[derive(NetworkBehaviour)]
@@ -47,12 +51,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let keypair_clone = id_keys.clone();
 
-    // To content-address message, we can take the hash of message and use it as an ID.
+    // Message signing function
     let message_id_fn = move |message: &gossipsub::Message| {
+        // We take our private key and sign the message
+        // The resulting signature is in bytes
         let message_signature = keypair_clone
             .sign(&message.data)
             .expect("failed signing message data");
 
+        // Serialize the public key into bytes
+        // The public key is 32 bytes long
         let public_key = keypair_clone
             .public()
             .into_ed25519()
@@ -105,6 +113,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("Enter messages via STDIN and they will be sent to connected peers using Gossipsub");
 
     let mempool = Arc::new(Mutex::new(Vec::<Transaction>::new()));
+
     let mut block_height = 1u32;
 
     let voters = Arc::new(Mutex::new(HashSet::<PeerId>::new()));
@@ -139,19 +148,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 println!("------> Transaction received on node: storing into local mempool and publishing");
                 let read_line = line.expect("Stdin not to close");
 
-                let typed_keypair = id_keys.clone().into_ed25519().unwrap();
-
-                mempool.lock().unwrap().push(Transaction {
-                    public_key: typed_keypair.public(),
-                    data: read_line.clone().as_bytes().to_vec(),
-                    signature: typed_keypair.sign(read_line.clone().as_bytes())
-                });
-
                 if let Err(e) = swarm.behaviour_mut().gossipsub.publish(
                     transactions_topic.clone(),
                     read_line.as_bytes(),
                 ) {
                     println!("Publish error: {e:?}");
+                } else {
+                    let typed_keypair = id_keys.clone().into_ed25519().unwrap();
+
+                    mempool.lock().unwrap().push(Transaction {
+                        public_key: typed_keypair.public(),
+                        data: read_line.clone().as_bytes().to_vec(),
+                        signature: typed_keypair.sign(read_line.clone().as_bytes())
+                    });
+
+                    println!("------> Transaction stored and published");
+                    println!("{mempool:?}");
                 }
 
                 if mempool.lock().unwrap().len() == 10 {
@@ -183,9 +195,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             }
                     }
                 }
-
-                println!("------> Transaction stored and published");
             },
+
             event = swarm.select_next_some() => match event {
                 SwarmEvent::Behaviour(EduCoinBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
                     for (peer_id, _multiaddr) in list {
@@ -223,7 +234,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     }
 
                     if message.topic == transaction_topic_hash {
-                        println!("------> got a new transactions, storing into mempool");
+                        println!("{}", String::from_utf8_lossy(&message.data));
+
+                        println!("------> got a new transaction, storing into mempool");
+
                         // create a transaction struct and push it into mempool
                         let transaction = Transaction {
                             public_key,
@@ -235,8 +249,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         let mempool_len = mempool.lock().unwrap().len();
                         println!("-----> num of transactions in mempool: {mempool_len}");
 
-                        // oh no, duplicated code! :D
-                        if mempool.lock().unwrap().len() == 10 {
+                         // oh no, duplicated code! :D
+                         if mempool.lock().unwrap().len() == 10 {
                             println!("------> collected 10 transactions, validating...");
                             let mut correct_transaction_num: u32 = 0;
 
